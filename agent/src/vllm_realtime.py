@@ -28,9 +28,9 @@ from livekit.agents.types import NOT_GIVEN, NotGivenOr
 
 logger = logging.getLogger("vllm-realtime")
 
-SAMPLE_RATE = 24000
+INPUT_SAMPLE_RATE = 16000
+OUTPUT_SAMPLE_RATE = 24000
 NUM_CHANNELS = 1
-AUDIO_CHUNK_MS = 100
 
 
 class _AudioStream:
@@ -103,7 +103,7 @@ class VLLMRealtimeModel(RealtimeModel):
         base_url: str,
         model: str,
         api_key: str = "",
-        sample_rate: int = SAMPLE_RATE,
+        sample_rate: int = OUTPUT_SAMPLE_RATE,
     ) -> None:
         super().__init__(
             capabilities=RealtimeCapabilities(
@@ -167,6 +167,7 @@ class VLLMRealtimeSession(RealtimeSession):
         self._generation_future: asyncio.Future | None = None
         self._full_transcript = ""
         self._audio_chunks_sent = 0
+        self._resampler: rtc.AudioResampler | None = None
 
     @property
     def chat_ctx(self) -> ChatContext:
@@ -196,7 +197,10 @@ class VLLMRealtimeSession(RealtimeSession):
         audio_b64 = base64.b64encode(pcm_bytes).decode("ascii")
         self._audio_chunks_sent += 1
         if self._audio_chunks_sent % 100 == 1:
-            logger.debug("Sending audio chunk #%d (%d bytes)", self._audio_chunks_sent, len(pcm_bytes))
+            logger.debug(
+                "Sending audio chunk #%d (%d bytes, %dHz)",
+                self._audio_chunks_sent, len(pcm_bytes), frame.sample_rate,
+            )
         self._send_queue.put_nowait({
             "type": "input_audio_buffer.append",
             "audio": audio_b64,
@@ -228,7 +232,8 @@ class VLLMRealtimeSession(RealtimeSession):
         pass
 
     def interrupt(self) -> None:
-        pass
+        logger.info("Interrupt requested — closing current generation")
+        self._finish_generation()
 
     def truncate(
         self,
@@ -351,7 +356,7 @@ class VLLMRealtimeSession(RealtimeSession):
             if not audio_b64:
                 return
 
-            sample_rate = event.get("sample_rate_hz", SAMPLE_RATE)
+            sample_rate = event.get("sample_rate_hz", OUTPUT_SAMPLE_RATE)
             pcm_bytes = base64.b64decode(audio_b64)
             samples_per_channel = len(pcm_bytes) // 2  # PCM16 = 2 bytes per sample
 
@@ -393,6 +398,7 @@ class VLLMRealtimeSession(RealtimeSession):
             logger.debug("Unhandled vLLM-Omni event: %s", event_type)
 
     def _start_generation(self) -> None:
+        logger.info("Starting generation — creating audio/text streams")
         self._current_audio_stream = _AudioStream()
         self._current_text_stream = _TextStream()
         self._full_transcript = ""
@@ -422,6 +428,7 @@ class VLLMRealtimeSession(RealtimeSession):
         self.emit("generation_created", event)
 
     def _finish_generation(self) -> None:
+        logger.info("Finishing generation — closing streams")
         if self._current_text_stream:
             self._current_text_stream.close()
             self._current_text_stream = None

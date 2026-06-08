@@ -32,6 +32,7 @@ async def entrypoint(ctx: JobContext):
     session = AgentSession(
         llm=model,
         vad=silero.VAD.load(),
+        turn_detection="vad",
     )
     await session.start(
         agent=VoiceAssistant(),
