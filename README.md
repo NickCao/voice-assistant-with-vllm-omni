@@ -94,6 +94,21 @@ pnpm dev
 
 Open http://localhost:3000, click **Start Conversation**, and speak.
 
+## OpenShift Deployment
+
+Container images are built automatically via GitHub Actions and pushed to GHCR on every push to main:
+
+- `ghcr.io/redhat-et/voice-assistant-with-vllm-omni/agent:latest`
+- `ghcr.io/redhat-et/voice-assistant-with-vllm-omni/frontend:latest`
+
+Deploy to OpenShift:
+
+```bash
+oc apply -k deploy/openshift/
+```
+
+See `deploy/openshift/` for the full set of manifests (LiveKit, agent, frontend, vLLM-Omni with GPU scheduling).
+
 ## Project Structure
 
 ```
@@ -108,6 +123,10 @@ Open http://localhost:3000, click **Start Conversation**, and speak.
 │   │   └── page.tsx
 │   └── components/
 │       └── VoiceAssistant.tsx
+├── deploy/
+│   └── openshift/          # Kustomize manifests for OpenShift
+├── .github/
+│   └── workflows/          # CI: build and push container images
 └── scripts/                # Startup scripts
 ```
 
