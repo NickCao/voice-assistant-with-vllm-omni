@@ -24,6 +24,8 @@ class VoiceAssistant(Agent):
 
 @server.rtc_session(agent_name="voice-assistant")
 async def entrypoint(ctx: JobContext):
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+
     model = VLLMRealtimeModel(
         base_url=VLLM_BASE_URL,
         model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
@@ -38,7 +40,6 @@ async def entrypoint(ctx: JobContext):
         agent=VoiceAssistant(),
         room=ctx.room,
     )
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
     logger.info("Voice assistant started, connected to vLLM-Omni at %s", VLLM_BASE_URL)
 
