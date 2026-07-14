@@ -5,24 +5,25 @@ Real-time voice assistant powered by [Qwen3-Omni](https://huggingface.co/Qwen/Qw
 ## Architecture
 
 ```
-[Local machine]                                           [GPU server (2x H100)]
-┌──────────┐  WebRTC  ┌──────────────┐                    ┌─────────────────────┐
-│ Browser   │◄───────►│ LiveKit      │                    │ vLLM-Omni           │
-│ (React)   │         │ Server :7880 │                    │ Qwen3-Omni          │
-│ :3000     │         └──────┬───────┘                    │ --tp 2              │
-└──────────┘                 │                            │ :8091               │
-                             ▼                            └──────────┬──────────┘
-                    ┌──────────────────┐   WebSocket                │
-                    │ LiveKit Agent    │◄──────────────────────────►│
-                    │ (Python)         │  ws://<gpu-host>:8091/v1/realtime
-                    └──────────────────┘
+┌──────────┐  WebRTC  ┌──────────────┐
+│ Browser   │◄───────►│ LiveKit      │
+│ (React)   │         │ Server :7880 │
+│ :3000     │         └──────┬───────┘
+└──────────┘                 │
+                             ▼
+                    ┌──────────────────┐   HTTP POST
+                    │ LiveKit Agent    │──────────────────►┌─────────────────────┐
+                    │ (Python)         │  /v1/chat/        │ vLLM-Omni           │
+                    └──────────────────┘  completions      │ Qwen3-Omni          │
+                                                          │ :8091               │
+                                                          └─────────────────────┘
 ```
 
-The browser captures audio via WebRTC, LiveKit routes it to a Python agent, and the agent streams it to vLLM-Omni's realtime WebSocket endpoint. Qwen3-Omni processes the audio natively (no separate STT/TTS) and streams spoken responses back.
+The browser captures audio via WebRTC, LiveKit routes it to a Python agent. The agent uses Silero VAD for turn detection, then sends the user's audio to vLLM-Omni's chat completion endpoint as a base64-encoded WAV. Qwen3-Omni processes the audio natively (no separate STT/TTS) and returns both text and spoken audio. Conversation history is maintained across turns.
 
 ## Prerequisites
 
-- **GPU server:** 2x NVIDIA H100, [vLLM-Omni](https://github.com/vllm-project/vllm-omni) installed
+- **GPU server:** 2x NVIDIA H100 (or equivalent), [vLLM-Omni](https://github.com/vllm-project/vllm-omni) installed
 - **Local machine:** Python 3.10+, Node.js 18+, pnpm, [livekit-server](https://github.com/livekit/livekit/releases)
 
 Install LiveKit server (macOS):
@@ -44,7 +45,6 @@ Or manually:
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
     --omni \
-    --tensor-parallel-size 2 \
     --host 0.0.0.0 \
     --port 8091
 ```
@@ -99,7 +99,9 @@ Open http://localhost:3000, click **Start Conversation**, and speak.
 ```
 ├── agent/                  # LiveKit Python agent
 │   ├── pyproject.toml
-│   └── src/agent.py        # Connects to vLLM-Omni via RealtimeModel
+│   └── src/
+│       ├── agent.py        # AgentSession entrypoint with Silero VAD
+│       └── vllm_realtime.py # RealtimeModel backed by chat completions
 ├── frontend/               # Next.js web UI
 │   ├── app/
 │   │   ├── api/token/      # JWT token generation for LiveKit
@@ -123,9 +125,9 @@ All configuration is via environment variables in `.env.local` files:
 ## Troubleshooting
 
 **Agent can't connect to vLLM-Omni:**
-- Ensure vLLM-Omni is running with `--omni` flag (required for `/v1/realtime` endpoint)
+- Ensure vLLM-Omni is running with `--omni` flag
 - Check the GPU server firewall allows port 8091
-- Enable debug logging: `LK_OPENAI_DEBUG=1 python src/agent.py dev`
+- Verify: `curl http://<gpu-server-ip>:8091/v1/models`
 
 **No audio response:**
 - Check browser microphone permissions
@@ -133,6 +135,5 @@ All configuration is via environment variables in `.env.local` files:
 - Ensure `LIVEKIT_URL` in frontend `.env.local` matches the LiveKit server address
 
 **High latency:**
-- Expected end-to-end latency is ~500ms-1s on 2x H100
-- Ensure tensor parallelism is enabled (`--tensor-parallel-size 2`)
+- Expected end-to-end latency is ~1-2s on 2x H100
 - Check GPU utilization with `nvidia-smi`

@@ -2,35 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
+import io
 import logging
 import time
-from collections.abc import AsyncIterable, AsyncIterator
+import wave
+from collections.abc import AsyncIterator
 from typing import Literal
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlparse
 
-import aiohttp
 from livekit import rtc
-from livekit.agents.llm.chat_context import ChatContext, ChatItem
+from livekit.agents.llm.chat_context import ChatContext
 from livekit.agents.llm.realtime import (
     GenerationCreatedEvent,
-    InputSpeechStartedEvent,
-    InputSpeechStoppedEvent,
-    InputTranscriptionCompleted,
     MessageGeneration,
     RealtimeCapabilities,
     RealtimeModel,
-    RealtimeModelError,
     RealtimeSession,
 )
 from livekit.agents.llm.tool_context import Tool, ToolChoice, ToolContext
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
+from openai import AsyncOpenAI
 
 logger = logging.getLogger("vllm-realtime")
 
-INPUT_SAMPLE_RATE = 16000
-OUTPUT_SAMPLE_RATE = 24000
-NUM_CHANNELS = 1
 
 
 class _AudioStream:
@@ -96,20 +90,48 @@ class _EmptyFunctionStream:
         raise StopAsyncIteration
 
 
+def _frames_to_wav_base64(frames: list[rtc.AudioFrame]) -> str:
+    if not frames:
+        return ""
+    pcm = b"".join(bytes(f.data) for f in frames)
+    sample_rate = frames[0].sample_rate
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _wav_bytes_to_frame(wav_data: bytes) -> rtc.AudioFrame | None:
+    buf = io.BytesIO(wav_data)
+    try:
+        with wave.open(buf, "rb") as w:
+            sr = w.getframerate()
+            ch = w.getnchannels()
+            pcm = w.readframes(w.getnframes())
+    except Exception:
+        return None
+    samples_per_channel = len(pcm) // (2 * ch)
+    if samples_per_channel == 0:
+        return None
+    return rtc.AudioFrame(
+        data=pcm, sample_rate=sr, num_channels=ch,
+        samples_per_channel=samples_per_channel,
+    )
+
+
 class VLLMRealtimeModel(RealtimeModel):
     def __init__(
-        self,
-        *,
-        base_url: str,
-        model: str,
-        api_key: str = "",
-        sample_rate: int = OUTPUT_SAMPLE_RATE,
+        self, *, base_url: str, model: str, api_key: str = "EMPTY",
+        speaker: str = "Ethan",
     ) -> None:
         super().__init__(
             capabilities=RealtimeCapabilities(
                 message_truncation=False,
                 turn_detection=False,
-                user_transcription=True,
+                user_transcription=False,
                 auto_tool_reply_generation=False,
                 audio_output=True,
                 manual_function_calls=False,
@@ -118,7 +140,7 @@ class VLLMRealtimeModel(RealtimeModel):
         self._base_url = base_url
         self._model_name = model
         self._api_key = api_key
-        self._sample_rate = sample_rate
+        self._speaker = speaker
         self._sessions: set[VLLMRealtimeSession] = set()
 
     @property
@@ -128,15 +150,6 @@ class VLLMRealtimeModel(RealtimeModel):
     @property
     def provider(self) -> str:
         return urlparse(self._base_url).hostname or "vllm-omni"
-
-    def _build_ws_url(self) -> str:
-        parsed = urlparse(self._base_url)
-        scheme = "wss" if parsed.scheme == "https" else "ws"
-        path = parsed.path.rstrip("/")
-        if not path.endswith("/realtime"):
-            path += "/realtime"
-        query = urlencode({"model": self._model_name})
-        return f"{scheme}://{parsed.hostname}:{parsed.port}{path}?{query}"
 
     def session(self) -> VLLMRealtimeSession:
         sess = VLLMRealtimeSession(self)
@@ -153,21 +166,18 @@ class VLLMRealtimeSession(RealtimeSession):
     def __init__(self, realtime_model: VLLMRealtimeModel) -> None:
         super().__init__(realtime_model)
         self._model = realtime_model
-        self._ws: aiohttp.ClientWebSocketResponse | None = None
-        self._http_session: aiohttp.ClientSession | None = None
-        self._send_queue: asyncio.Queue[dict] = asyncio.Queue()
-        self._connected = False
+        self._client = AsyncOpenAI(
+            api_key=realtime_model._api_key, base_url=realtime_model._base_url,
+        )
         self._closed = False
-        self._main_task: asyncio.Task | None = None
         self._chat_ctx = ChatContext()
         self._tool_ctx = ToolContext([])
         self._instructions = ""
+        self._conversation: list[dict] = []
+        self._audio_buffer: list[rtc.AudioFrame] = []
         self._current_audio_stream: _AudioStream | None = None
         self._current_text_stream: _TextStream | None = None
-        self._generation_future: asyncio.Future | None = None
-        self._full_transcript = ""
-        self._audio_chunks_sent = 0
-        self._resampler: rtc.AudioResampler | None = None
+        self._generation_task: asyncio.Task | None = None
 
     @property
     def chat_ctx(self) -> ChatContext:
@@ -192,19 +202,7 @@ class VLLMRealtimeSession(RealtimeSession):
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         if self._closed:
             return
-        self._ensure_connected()
-        pcm_bytes = bytes(frame.data)
-        audio_b64 = base64.b64encode(pcm_bytes).decode("ascii")
-        self._audio_chunks_sent += 1
-        if self._audio_chunks_sent % 100 == 1:
-            logger.debug(
-                "Sending audio chunk #%d (%d bytes, %dHz)",
-                self._audio_chunks_sent, len(pcm_bytes), frame.sample_rate,
-            )
-        self._send_queue.put_nowait({
-            "type": "input_audio_buffer.append",
-            "audio": audio_b64,
-        })
+        self._audio_buffer.append(frame)
 
     def push_video(self, frame: rtc.VideoFrame) -> None:
         pass
@@ -216,192 +214,66 @@ class VLLMRealtimeSession(RealtimeSession):
         tool_choice: NotGivenOr[ToolChoice] = NOT_GIVEN,
         tools: NotGivenOr[list[Tool]] = NOT_GIVEN,
     ) -> asyncio.Future[GenerationCreatedEvent]:
-        self._ensure_connected()
-        self.commit_audio()
         fut: asyncio.Future[GenerationCreatedEvent] = asyncio.get_event_loop().create_future()
-        self._generation_future = fut
+
+        frames = list(self._audio_buffer)
+        self._audio_buffer.clear()
+
+        if self._generation_task and not self._generation_task.done():
+            self._generation_task.cancel()
+
+        self._generation_task = asyncio.create_task(
+            self._run_generation(frames, fut)
+        )
         return fut
 
     def commit_audio(self) -> None:
-        logger.info("Committing audio buffer (%d chunks sent)", self._audio_chunks_sent)
-        self._send_queue.put_nowait({
-            "type": "input_audio_buffer.commit",
-        })
-
-    def clear_audio(self) -> None:
         pass
 
+    def clear_audio(self) -> None:
+        self._audio_buffer.clear()
+
     def interrupt(self) -> None:
-        logger.info("Interrupt requested — closing current generation")
+        logger.info("Interrupt requested")
+        if self._generation_task and not self._generation_task.done():
+            self._generation_task.cancel()
         self._finish_generation()
 
     def truncate(
-        self,
-        *,
-        message_id: str,
-        modalities: list[Literal["text", "audio"]],
-        audio_end_ms: int,
-        audio_transcript: NotGivenOr[str] = NOT_GIVEN,
+        self, *, message_id: str, modalities: list[Literal["text", "audio"]],
+        audio_end_ms: int, audio_transcript: NotGivenOr[str] = NOT_GIVEN,
     ) -> None:
         pass
 
-    def _ensure_connected(self) -> None:
-        if self._main_task is None and not self._closed:
-            self._main_task = asyncio.create_task(self._run())
+    async def _run_generation(
+        self,
+        frames: list[rtc.AudioFrame],
+        fut: asyncio.Future[GenerationCreatedEvent],
+    ) -> None:
+        wav_b64 = _frames_to_wav_base64(frames)
+        if not wav_b64:
+            logger.warning("No audio to process")
+            if not fut.done():
+                fut.set_exception(RuntimeError("No audio to process"))
+            return
 
-    async def _run(self) -> None:
-        ws_url = self._model._build_ws_url()
-        logger.info("Connecting to vLLM-Omni realtime at %s", ws_url)
+        logger.info("Generating reply from %d audio frames", len(frames))
 
-        headers = {}
-        if self._model._api_key:
-            headers["Authorization"] = f"Bearer {self._model._api_key}"
+        # PoC: conversation history grows unbounded (including base64 audio).
+        # Production code should trim older turns or replace audio with transcripts.
+        messages: list[dict] = []
+        if self._instructions:
+            messages.append({"role": "system", "content": self._instructions})
+        messages.extend(self._conversation)
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{wav_b64}"}},
+            ],
+        })
 
-        start_time = time.time()
-        try:
-            self._http_session = aiohttp.ClientSession()
-            self._ws = await self._http_session.ws_connect(ws_url, headers=headers)
-            acquire_time = time.time() - start_time
-            self._connected = True
-            self._report_connection_acquired(acquire_time)
-            logger.info("Connected to vLLM-Omni realtime (%.2fs)", acquire_time)
-
-            self._send_queue.put_nowait({
-                "type": "session.update",
-                "model": self._model._model_name,
-            })
-
-            send_task = asyncio.create_task(self._send_loop())
-            recv_task = asyncio.create_task(self._recv_loop())
-
-            done, pending = await asyncio.wait(
-                [send_task, recv_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
-            for task in done:
-                if task.exception():
-                    logger.error("Task failed: %s", task.exception())
-
-        except Exception as e:
-            logger.error("Failed to connect to vLLM-Omni: %s", e)
-            self.emit(
-                "error",
-                RealtimeModelError(
-                    timestamp=time.time(),
-                    label="vllm-omni",
-                    error=e,
-                    recoverable=False,
-                ),
-            )
-        finally:
-            self._connected = False
-            if self._ws and not self._ws.closed:
-                await self._ws.close()
-            if self._http_session and not self._http_session.closed:
-                await self._http_session.close()
-
-    async def _send_loop(self) -> None:
-        while self._connected and self._ws and not self._ws.closed:
-            try:
-                event = await asyncio.wait_for(self._send_queue.get(), timeout=1.0)
-                await self._ws.send_str(json.dumps(event))
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                logger.error("Send error: %s", e)
-                break
-
-    async def _recv_loop(self) -> None:
-        assert self._ws is not None
-        async for msg in self._ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                try:
-                    event = json.loads(msg.data)
-                    await self._handle_event(event)
-                except json.JSONDecodeError:
-                    logger.warning("Invalid JSON from vLLM-Omni: %s", msg.data[:200])
-            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                logger.info("WebSocket closed: %s", msg.type)
-                break
-
-    async def _handle_event(self, event: dict) -> None:
-        event_type = event.get("type", "")
-
-        if event_type == "session.created":
-            logger.info("vLLM-Omni session created")
-
-        elif event_type == "transcription.delta":
-            delta = event.get("delta", "")
-            if delta:
-                self._full_transcript += delta
-                if self._current_text_stream:
-                    self._current_text_stream.push(delta)
-
-        elif event_type == "transcription.done":
-            text = event.get("text", self._full_transcript)
-            logger.info("Transcription done: %s", text[:100])
-            self.emit(
-                "input_audio_transcription_completed",
-                InputTranscriptionCompleted(
-                    item_id="vllm-transcript",
-                    transcript=text,
-                    is_final=True,
-                ),
-            )
-
-        elif event_type == "response.audio.delta":
-            audio_b64 = event.get("audio", "")
-            if not audio_b64:
-                return
-
-            sample_rate = event.get("sample_rate_hz", OUTPUT_SAMPLE_RATE)
-            pcm_bytes = base64.b64decode(audio_b64)
-            samples_per_channel = len(pcm_bytes) // 2  # PCM16 = 2 bytes per sample
-
-            if samples_per_channel == 0:
-                return
-
-            frame = rtc.AudioFrame(
-                data=pcm_bytes,
-                sample_rate=sample_rate,
-                num_channels=NUM_CHANNELS,
-                samples_per_channel=samples_per_channel,
-            )
-
-            if self._current_audio_stream is None:
-                self._start_generation()
-
-            if self._current_audio_stream:
-                self._current_audio_stream.push(frame)
-
-        elif event_type == "response.audio.done":
-            logger.info("Audio response complete")
-            self._finish_generation()
-
-        elif event_type == "error":
-            error_msg = event.get("error", "Unknown error")
-            code = event.get("code", "unknown")
-            logger.error("vLLM-Omni error [%s]: %s", code, error_msg)
-            self.emit(
-                "error",
-                RealtimeModelError(
-                    timestamp=time.time(),
-                    label="vllm-omni",
-                    error=Exception(f"[{code}] {error_msg}"),
-                    recoverable=True,
-                ),
-            )
-
-        else:
-            logger.debug("Unhandled vLLM-Omni event: %s", event_type)
-
-    def _start_generation(self) -> None:
-        logger.info("Starting generation — creating audio/text streams")
         self._current_audio_stream = _AudioStream()
         self._current_text_stream = _TextStream()
-        self._full_transcript = ""
 
         modalities_fut: asyncio.Future[list[Literal["text", "audio"]]] = (
             asyncio.get_event_loop().create_future()
@@ -421,14 +293,59 @@ class VLLMRealtimeSession(RealtimeSession):
             user_initiated=False,
         )
 
-        if self._generation_future and not self._generation_future.done():
-            self._generation_future.set_result(event)
-            self._generation_future = None
-
+        if not fut.done():
+            fut.set_result(event)
         self.emit("generation_created", event)
 
+        user_message = {
+            "role": "user",
+            "content": [
+                {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{wav_b64}"}},
+            ],
+        }
+
+        assistant_text = ""
+        try:
+            stream = await self._client.chat.completions.create(
+                model=self._model._model_name,
+                modalities=["text", "audio"],
+                messages=messages,
+                stream=True,
+                extra_body={"speaker": self._model._speaker},
+            )
+
+            async for chunk in stream:
+                modality = getattr(chunk, "modality", None)
+                for choice in chunk.choices:
+                    delta = getattr(choice, "delta", None)
+                    content = getattr(delta, "content", None) if delta else None
+                    if not content:
+                        continue
+
+                    if modality == "audio":
+                        frame = _wav_bytes_to_frame(base64.b64decode(content))
+                        if frame and self._current_audio_stream:
+                            self._current_audio_stream.push(frame)
+                    else:
+                        assistant_text += content
+                        if self._current_text_stream:
+                            self._current_text_stream.push(content)
+
+        except asyncio.CancelledError:
+            logger.info("Generation cancelled")
+        except Exception:
+            logger.exception("Chat completion error")
+        finally:
+            if assistant_text:
+                logger.info("Assistant: %s", assistant_text[:100])
+                self._conversation.append(user_message)
+                self._conversation.append({
+                    "role": "assistant",
+                    "content": assistant_text,
+                })
+            self._finish_generation()
+
     def _finish_generation(self) -> None:
-        logger.info("Finishing generation — closing streams")
         if self._current_text_stream:
             self._current_text_stream.close()
             self._current_text_stream = None
@@ -438,15 +355,12 @@ class VLLMRealtimeSession(RealtimeSession):
 
     async def aclose(self) -> None:
         self._closed = True
-        self._finish_generation()
-        if self._main_task:
-            self._main_task.cancel()
+        if self._generation_task and not self._generation_task.done():
+            self._generation_task.cancel()
             try:
-                await self._main_task
+                await self._generation_task
             except (asyncio.CancelledError, Exception):
                 pass
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        if self._http_session and not self._http_session.closed:
-            await self._http_session.close()
+        self._finish_generation()
+        await self._client.close()
         self._model._sessions.discard(self)
