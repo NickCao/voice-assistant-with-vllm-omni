@@ -36,7 +36,7 @@ async def entrypoint(ctx: JobContext):
         llm=model,
         vad=silero.VAD.load(),
         turn_detection="vad",
-        mcp_servers=[mcp.MCPServerHTTP(url="https://api.githubcopilot.com/mcp/")],
+        mcp_servers=[mcp.MCPServerHTTP(url="https://instances-mcp.vantage.sh/mcp/c7d0bef0-0b04-4141-a2dc-1b0f850b2c29")],
     )
     await session.start(
         agent=VoiceAssistant(),
