@@ -238,7 +238,8 @@ class VLLMRealtimeSession(RealtimeSession):
         self._audio_buffer.clear()
 
     def interrupt(self) -> None:
-        logger.info("Interrupt requested")
+        import traceback
+        logger.info("Interrupt requested, stack:\n%s", "".join(traceback.format_stack()))
         self._interrupted = True
         if self._generation_task and not self._generation_task.done():
             self._generation_task.cancel()
