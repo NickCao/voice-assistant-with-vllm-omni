@@ -222,8 +222,9 @@ class VLLMRealtimeSession(RealtimeSession):
         if self._generation_task and not self._generation_task.done():
             self._generation_task.cancel()
 
+        tc = tool_choice if isinstance(tool_choice, str) else "auto"
         self._generation_task = asyncio.create_task(
-            self._run_generation(frames, fut)
+            self._run_generation(frames, fut, tool_choice=tc)
         )
         return fut
 
@@ -250,6 +251,7 @@ class VLLMRealtimeSession(RealtimeSession):
         self,
         frames: list[rtc.AudioFrame],
         fut: asyncio.Future[GenerationCreatedEvent],
+        tool_choice: str = "auto",
     ) -> None:
         wav_b64 = _frames_to_wav_base64(frames)
         if not wav_b64:
@@ -306,8 +308,10 @@ class VLLMRealtimeSession(RealtimeSession):
             ],
         }
 
-        tools_param = self._tool_ctx.parse_function_tools("openai") or None
-        logger.info("Tools available: %d", len(tools_param) if tools_param else 0)
+        tools_param = None
+        if tool_choice != "none":
+            tools_param = self._tool_ctx.parse_function_tools("openai") or None
+        logger.info("Tools available: %d (tool_choice=%s)", len(tools_param) if tools_param else 0, tool_choice)
 
         assistant_text = ""
         generation_start = time.perf_counter()
@@ -323,7 +327,7 @@ class VLLMRealtimeSession(RealtimeSession):
             }
             if tools_param:
                 kwargs["tools"] = tools_param
-                kwargs["tool_choice"] = "auto"
+                kwargs["tool_choice"] = tool_choice
 
             state = ChatCompletionStreamState(
                 input_tools=tools_param or [],
@@ -356,7 +360,7 @@ class VLLMRealtimeSession(RealtimeSession):
                         continue
                     content = getattr(delta, "content", None)
 
-                    if modality == "audio" and content and not has_tool_calls:
+                    if modality == "audio" and content and not tools_param:
                         if first_audio:
                             first_audio = False
                             ttfa = time.perf_counter() - generation_start
