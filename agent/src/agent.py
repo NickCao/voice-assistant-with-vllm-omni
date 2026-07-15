@@ -29,6 +29,7 @@ async def entrypoint(ctx: JobContext):
     model = VLLMRealtimeModel(
         base_url=VLLM_BASE_URL,
         model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        room=ctx.room,
     )
 
     session = AgentSession(

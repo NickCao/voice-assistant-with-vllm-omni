@@ -6,6 +6,7 @@ import {
   BarVisualizer,
   DisconnectButton,
   useVoiceAssistant,
+  useDataChannel,
 } from "@livekit/components-react";
 import "@livekit/components-styles";
 import { useCallback, useState } from "react";
@@ -17,15 +18,136 @@ interface ConnectionDetails {
   participantToken: string;
 }
 
-function AgentVisualizer() {
-  const { state, audioTrack } = useVoiceAssistant();
+interface LatencyPoint {
+  ms: number;
+  interrupted: boolean;
+}
+
+const MAX_LATENCY_POINTS = 20;
+
+function LatencyChart({ points }: { points: LatencyPoint[] }) {
+  if (points.length === 0) return null;
+
+  const ms = points.map((p) => p.ms);
+  const max = Math.max(...ms, 100);
+  const h = 160;
+  const w = 480;
+  const barW = w / MAX_LATENCY_POINTS;
+  const normalPoints = points.filter((p) => !p.interrupted);
+  const normalMs = normalPoints.map((p) => p.ms);
 
   return (
-    <div className="flex flex-col items-center gap-8">
+    <div className="w-full max-w-lg">
+      <div
+        className="flex items-end justify-between rounded-lg bg-zinc-900 p-4"
+        style={{ height: h + 32 }}
+      >
+        <svg
+          width={w}
+          height={h}
+          viewBox={`0 0 ${w} ${h}`}
+          className="w-full"
+        >
+          {points.map((p, i) => {
+            const barH = (p.ms / max) * (h - 20);
+            const x = i * barW;
+            const color = p.interrupted
+              ? "#a78bfa"
+              : p.ms < 300
+                ? "#22c55e"
+                : p.ms < 500
+                  ? "#eab308"
+                  : "#ef4444";
+            return (
+              <g key={i}>
+                <rect
+                  x={x + 2}
+                  y={h - barH}
+                  width={barW - 4}
+                  height={barH}
+                  rx={3}
+                  fill={color}
+                  opacity={p.interrupted ? 0.5 : 0.85}
+                />
+                {p.interrupted && (
+                  <line
+                    x1={x + 2}
+                    y1={h - barH + 4}
+                    x2={x + barW - 4}
+                    y2={h - 4}
+                    stroke={color}
+                    strokeWidth={1}
+                    opacity={0.6}
+                  />
+                )}
+                <text
+                  x={x + barW / 2}
+                  y={h - barH - 4}
+                  textAnchor="middle"
+                  fontSize={10}
+                  fill="#a1a1aa"
+                >
+                  {Math.round(p.ms)}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+      <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
+        <span>
+          Last:{" "}
+          <span className="text-zinc-300">
+            {Math.round(ms[ms.length - 1])}ms
+          </span>
+        </span>
+        <span>
+          Avg:{" "}
+          <span className="text-zinc-300">
+            {normalMs.length > 0
+              ? Math.round(
+                  normalMs.reduce((a, b) => a + b, 0) / normalMs.length,
+                )
+              : "—"}
+            ms
+          </span>
+        </span>
+        <span>
+          Min:{" "}
+          <span className="text-zinc-300">
+            {normalMs.length > 0 ? Math.round(Math.min(...normalMs)) : "—"}ms
+          </span>
+        </span>
+        <span>
+          <span className="text-violet-400">■</span> interrupted
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function AgentVisualizer() {
+  const { state, audioTrack } = useVoiceAssistant();
+  const [points, setPoints] = useState<LatencyPoint[]>([]);
+  useDataChannel("latency", (msg) => {
+    try {
+      const data = JSON.parse(new TextDecoder().decode(msg.payload));
+      if (typeof data.ttfa === "number") {
+        setPoints((prev) => [
+          ...prev.slice(-MAX_LATENCY_POINTS + 1),
+          { ms: data.ttfa * 1000, interrupted: data.interrupted === true },
+        ]);
+      }
+    } catch {}
+  });
+
+  return (
+    <div className="flex flex-col items-center gap-6">
       <div className="h-48 w-full max-w-md">
         <BarVisualizer state={state} barCount={5} trackRef={audioTrack} />
       </div>
       <p className="text-sm text-zinc-400 capitalize">{state}</p>
+      <LatencyChart points={points} />
     </div>
   );
 }
