@@ -337,7 +337,15 @@ class VLLMRealtimeSession(RealtimeSession):
             async for chunk in stream:
                 for event in state.handle_chunk(chunk):
                     if event.type == "tool_calls.function.arguments.done":
-                        has_tool_calls = True
+                        if not has_tool_calls:
+                            has_tool_calls = True
+                            # Close audio/text streams so forward_generation unblocks
+                            if self._current_audio_stream:
+                                self._current_audio_stream.close()
+                                self._current_audio_stream = None
+                            if self._current_text_stream:
+                                self._current_text_stream.close()
+                                self._current_text_stream = None
                         call_id = getattr(event, "call_id", "") or f"call_{event.index}"
                         logger.info("Tool call: %s(%s)", event.name, event.arguments[:100])
                         if self._model._room:
