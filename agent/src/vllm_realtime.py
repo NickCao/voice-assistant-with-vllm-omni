@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json as json_mod
 import logging
 import time
 import wave
@@ -11,6 +12,7 @@ from typing import Literal
 from urllib.parse import urlparse
 
 from livekit import rtc
+from livekit.agents.utils.aio import Chan
 from livekit.agents.llm.chat_context import ChatContext
 from livekit.agents.llm.realtime import (
     GenerationCreatedEvent,
@@ -19,9 +21,11 @@ from livekit.agents.llm.realtime import (
     RealtimeModel,
     RealtimeSession,
 )
+from livekit.agents.llm import FunctionCall
 from livekit.agents.llm.tool_context import Tool, ToolChoice, ToolContext
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
 from openai import AsyncOpenAI
+from openai.lib.streaming.chat import ChatCompletionStreamState
 
 logger = logging.getLogger("vllm-realtime")
 
@@ -81,13 +85,6 @@ class _MessageStream:
         self._sent = True
         return self._generation
 
-
-class _EmptyFunctionStream:
-    def __aiter__(self) -> AsyncIterator:
-        return self
-
-    async def __anext__(self):
-        raise StopAsyncIteration
 
 
 def _frames_to_wav_base64(frames: list[rtc.AudioFrame]) -> str:
@@ -278,6 +275,7 @@ class VLLMRealtimeSession(RealtimeSession):
 
         self._current_audio_stream = _AudioStream()
         self._current_text_stream = _TextStream()
+        self._current_function_stream: Chan[FunctionCall] = Chan()
 
         modalities_fut: asyncio.Future[list[Literal["text", "audio"]]] = (
             asyncio.get_event_loop().create_future()
@@ -293,7 +291,7 @@ class VLLMRealtimeSession(RealtimeSession):
 
         event = GenerationCreatedEvent(
             message_stream=_MessageStream(generation),
-            function_stream=_EmptyFunctionStream(),
+            function_stream=self._current_function_stream,
             user_initiated=False,
         )
 
@@ -308,27 +306,38 @@ class VLLMRealtimeSession(RealtimeSession):
             ],
         }
 
+        tools_param = self._tool_ctx.parse_function_tools("openai") or None
+
         assistant_text = ""
         generation_start = time.perf_counter()
         first_audio = True
         try:
-            stream = await self._client.chat.completions.create(
-                model=self._model._model_name,
-                modalities=["text", "audio"],
-                messages=messages,
-                stream=True,
-                extra_body={"speaker": self._model._speaker},
+            kwargs: dict = {
+                "model": self._model._model_name,
+                "modalities": ["text", "audio"],
+                "messages": messages,
+                "stream": True,
+                "extra_body": {"speaker": self._model._speaker},
+            }
+            if tools_param:
+                kwargs["tools"] = tools_param
+                kwargs["tool_choice"] = "auto"
+
+            state = ChatCompletionStreamState(
+                input_tools=tools_param or [],
             )
+            stream = await self._client.chat.completions.create(**kwargs)
 
             async for chunk in stream:
+                state.handle_chunk(chunk)
                 modality = getattr(chunk, "modality", None)
                 for choice in chunk.choices:
                     delta = getattr(choice, "delta", None)
-                    content = getattr(delta, "content", None) if delta else None
-                    if not content:
+                    if not delta:
                         continue
+                    content = getattr(delta, "content", None)
 
-                    if modality == "audio":
+                    if modality == "audio" and content:
                         if first_audio:
                             first_audio = False
                             ttfa = time.perf_counter() - generation_start
@@ -343,10 +352,41 @@ class VLLMRealtimeSession(RealtimeSession):
                         frame = _wav_bytes_to_frame(base64.b64decode(content))
                         if frame and self._current_audio_stream:
                             self._current_audio_stream.push(frame)
-                    else:
+                    elif content:
                         assistant_text += content
                         if self._current_text_stream:
                             self._current_text_stream.push(content)
+
+            # Emit tool calls accumulated by the SDK
+            completion = state.get_final_completion()
+            if completion.choices:
+                msg = completion.choices[0].message
+                if msg.tool_calls:
+                    # Publish TTFA as a tool_call turn (no audio produced)
+                    if not first_audio:
+                        pass  # audio was produced, TTFA already published
+                    else:
+                        ttfa = time.perf_counter() - generation_start
+                        logger.info("Time to first tool call: %.3fs", ttfa)
+                        if self._model._room:
+                            await self._model._room.local_participant.publish_data(
+                                f'{{"ttfa": {ttfa:.3f}, "tool_call": true}}'.encode(),
+                                topic="latency",
+                            )
+
+                    for tc in msg.tool_calls:
+                        logger.info("Tool call: %s(%s)", tc.function.name, tc.function.arguments[:100])
+                        if self._model._room:
+                            await self._model._room.local_participant.publish_data(
+                                json_mod.dumps({"name": tc.function.name, "arguments": tc.function.arguments}).encode(),
+                                topic="tool_call",
+                            )
+                        fnc_call = FunctionCall(
+                            call_id=tc.id,
+                            name=tc.function.name,
+                            arguments=tc.function.arguments,
+                        )
+                        self._current_function_stream.send_nowait(fnc_call)
 
         except asyncio.CancelledError:
             logger.info("Generation cancelled")
@@ -369,6 +409,9 @@ class VLLMRealtimeSession(RealtimeSession):
         if self._current_audio_stream:
             self._current_audio_stream.close()
             self._current_audio_stream = None
+        if getattr(self, "_current_function_stream", None) is not None:
+            self._current_function_stream.close()
+            self._current_function_stream = None
 
     async def aclose(self) -> None:
         self._closed = True

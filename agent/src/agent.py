@@ -2,7 +2,7 @@ import logging
 import os
 
 from dotenv import load_dotenv
-from livekit.agents import Agent, AgentServer, AgentSession, AutoSubscribe, JobContext, cli
+from livekit.agents import Agent, AgentServer, AgentSession, AutoSubscribe, JobContext, cli, mcp
 from livekit.plugins import silero
 
 from vllm_realtime import VLLMRealtimeModel
@@ -18,7 +18,7 @@ server = AgentServer()
 class VoiceAssistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="You are a helpful voice assistant. Respond naturally and concisely.",
+            instructions="You are a helpful voice assistant. Respond naturally and concisely. You have access to tools — use them when appropriate.",
         )
 
 
@@ -36,6 +36,7 @@ async def entrypoint(ctx: JobContext):
         llm=model,
         vad=silero.VAD.load(),
         turn_detection="vad",
+        mcp_servers=[mcp.MCPServerHTTP(url="https://api.githubcopilot.com/mcp/")],
     )
     await session.start(
         agent=VoiceAssistant(),

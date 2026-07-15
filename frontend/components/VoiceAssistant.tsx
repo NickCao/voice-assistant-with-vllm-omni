@@ -21,6 +21,13 @@ interface ConnectionDetails {
 interface LatencyPoint {
   ms: number;
   interrupted: boolean;
+  toolCall: boolean;
+}
+
+interface ToolCallEntry {
+  name: string;
+  arguments: string;
+  timestamp: number;
 }
 
 const MAX_LATENCY_POINTS = 20;
@@ -33,7 +40,7 @@ function LatencyChart({ points }: { points: LatencyPoint[] }) {
   const h = 160;
   const w = 480;
   const barW = w / MAX_LATENCY_POINTS;
-  const normalPoints = points.filter((p) => !p.interrupted);
+  const normalPoints = points.filter((p) => !p.interrupted && !p.toolCall);
   const normalMs = normalPoints.map((p) => p.ms);
 
   return (
@@ -51,13 +58,15 @@ function LatencyChart({ points }: { points: LatencyPoint[] }) {
           {points.map((p, i) => {
             const barH = (p.ms / max) * (h - 20);
             const x = i * barW;
-            const color = p.interrupted
-              ? "#a78bfa"
-              : p.ms < 300
-                ? "#22c55e"
-                : p.ms < 500
-                  ? "#eab308"
-                  : "#ef4444";
+            const color = p.toolCall
+              ? "#38bdf8"
+              : p.interrupted
+                ? "#a78bfa"
+                : p.ms < 300
+                  ? "#22c55e"
+                  : p.ms < 500
+                    ? "#eab308"
+                    : "#ef4444";
             return (
               <g key={i}>
                 <rect
@@ -67,7 +76,7 @@ function LatencyChart({ points }: { points: LatencyPoint[] }) {
                   height={barH}
                   rx={3}
                   fill={color}
-                  opacity={p.interrupted ? 0.5 : 0.85}
+                  opacity={p.interrupted || p.toolCall ? 0.5 : 0.85}
                 />
                 {p.interrupted && (
                   <line
@@ -119,8 +128,34 @@ function LatencyChart({ points }: { points: LatencyPoint[] }) {
           </span>
         </span>
         <span>
+          <span className="text-sky-400">■</span> tool
+          {" "}
           <span className="text-violet-400">■</span> interrupted
         </span>
+      </div>
+    </div>
+  );
+}
+
+function ToolCallLog({ entries }: { entries: ToolCallEntry[] }) {
+  if (entries.length === 0) return null;
+
+  return (
+    <div className="w-full max-w-lg">
+      <div className="rounded-lg bg-zinc-900 p-3">
+        <p className="mb-2 text-xs font-medium text-zinc-400">Tool Calls</p>
+        <div className="flex flex-col gap-1.5 max-h-40 overflow-y-auto">
+          {entries.map((entry, i) => (
+            <div key={i} className="rounded bg-zinc-800 px-2.5 py-1.5 text-xs">
+              <span className="font-mono text-emerald-400">{entry.name}</span>
+              <span className="text-zinc-500 ml-1 break-all">
+                ({entry.arguments.length > 80
+                  ? entry.arguments.slice(0, 80) + "…"
+                  : entry.arguments})
+              </span>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -129,13 +164,27 @@ function LatencyChart({ points }: { points: LatencyPoint[] }) {
 function AgentVisualizer() {
   const { state, audioTrack } = useVoiceAssistant();
   const [points, setPoints] = useState<LatencyPoint[]>([]);
+  const [toolCalls, setToolCalls] = useState<ToolCallEntry[]>([]);
+
   useDataChannel("latency", (msg) => {
     try {
       const data = JSON.parse(new TextDecoder().decode(msg.payload));
       if (typeof data.ttfa === "number") {
         setPoints((prev) => [
           ...prev.slice(-MAX_LATENCY_POINTS + 1),
-          { ms: data.ttfa * 1000, interrupted: data.interrupted === true },
+          { ms: data.ttfa * 1000, interrupted: data.interrupted === true, toolCall: data.tool_call === true },
+        ]);
+      }
+    } catch {}
+  });
+
+  useDataChannel("tool_call", (msg) => {
+    try {
+      const data = JSON.parse(new TextDecoder().decode(msg.payload));
+      if (data.name) {
+        setToolCalls((prev) => [
+          ...prev.slice(-9),
+          { name: data.name, arguments: data.arguments || "", timestamp: Date.now() },
         ]);
       }
     } catch {}
@@ -147,6 +196,7 @@ function AgentVisualizer() {
         <BarVisualizer state={state} barCount={5} trackRef={audioTrack} />
       </div>
       <p className="text-sm text-zinc-400 capitalize">{state}</p>
+      <ToolCallLog entries={toolCalls} />
       <LatencyChart points={points} />
     </div>
   );
