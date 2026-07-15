@@ -131,7 +131,7 @@ class VLLMRealtimeModel(RealtimeModel):
                 turn_detection=False,
                 user_transcription=False,
                 auto_tool_reply_generation=False,
-                audio_output=True,
+                audio_output=False,
                 manual_function_calls=False,
             )
         )
@@ -179,6 +179,8 @@ class VLLMRealtimeSession(RealtimeSession):
         self._generation_task: asyncio.Task | None = None
         self._interrupted = False
         self._has_pending_tool_calls = False
+        self._audio_source: rtc.AudioSource | None = None
+        self._audio_track_published = False
 
     @property
     def chat_ctx(self) -> ChatContext:
@@ -236,9 +238,6 @@ class VLLMRealtimeSession(RealtimeSession):
         self._audio_buffer.clear()
 
     def interrupt(self) -> None:
-        if self._has_pending_tool_calls:
-            logger.info("Interrupt requested but tool calls pending — ignoring")
-            return
         logger.info("Interrupt requested")
         self._interrupted = True
         if self._generation_task and not self._generation_task.done():
@@ -279,19 +278,18 @@ class VLLMRealtimeSession(RealtimeSession):
             ],
         })
 
-        self._current_audio_stream = _AudioStream()
         self._current_text_stream = _TextStream()
         self._current_function_stream: Chan[FunctionCall] = Chan()
 
         modalities_fut: asyncio.Future[list[Literal["text", "audio"]]] = (
             asyncio.get_event_loop().create_future()
         )
-        modalities_fut.set_result(["audio", "text"])
+        modalities_fut.set_result(["text"])
 
         generation = MessageGeneration(
             message_id=f"vllm-msg-{int(time.time())}",
             text_stream=self._current_text_stream,
-            audio_stream=self._current_audio_stream,
+            audio_stream=_AudioStream(),
             modalities=modalities_fut,
         )
 
@@ -344,13 +342,6 @@ class VLLMRealtimeSession(RealtimeSession):
                         if not has_tool_calls:
                             has_tool_calls = True
                             self._has_pending_tool_calls = True
-                            # Close audio/text streams so forward_generation unblocks
-                            if self._current_audio_stream:
-                                self._current_audio_stream.close()
-                                self._current_audio_stream = None
-                            if self._current_text_stream:
-                                self._current_text_stream.close()
-                                self._current_text_stream = None
                         call_id = getattr(event, "call_id", "") or f"call_{event.index}"
                         logger.info("Tool call: %s(%s)", event.name, event.arguments[:100])
                         if self._model._room:
@@ -386,8 +377,9 @@ class VLLMRealtimeSession(RealtimeSession):
                                     topic="latency",
                                 )
                         frame = _wav_bytes_to_frame(base64.b64decode(content))
-                        if frame and self._current_audio_stream:
-                            self._current_audio_stream.push(frame)
+                        if frame:
+                            await self._ensure_audio_source()
+                            await self._audio_source.capture_frame(frame)
                     elif content:
                         assistant_text += content
                         if self._current_text_stream:
@@ -407,14 +399,21 @@ class VLLMRealtimeSession(RealtimeSession):
             })
         self._finish_generation()
 
+    async def _ensure_audio_source(self) -> None:
+        if self._audio_source is None:
+            self._audio_source = rtc.AudioSource(24000, 1)
+        if not self._audio_track_published and self._model._room:
+            track = rtc.LocalAudioTrack.create_audio_track("assistant-audio", self._audio_source)
+            await self._model._room.local_participant.publish_track(
+                track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE),
+            )
+            self._audio_track_published = True
+
     def _finish_generation(self) -> None:
         self._has_pending_tool_calls = False
         if self._current_text_stream:
             self._current_text_stream.close()
             self._current_text_stream = None
-        if self._current_audio_stream:
-            self._current_audio_stream.close()
-            self._current_audio_stream = None
         if getattr(self, "_current_function_stream", None) is not None:
             self._current_function_stream.close()
             self._current_function_stream = None
