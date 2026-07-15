@@ -380,20 +380,9 @@ class VLLMRealtimeSession(RealtimeSession):
                                     f'{{"ttfa": {ttfa:.3f}, "interrupted": {str(interrupted).lower()}}}'.encode(),
                                     topic="latency",
                                 )
-                        if has_tool_calls:
-                            # Push silence to keep playback alive during tool execution
-                            silent = rtc.AudioFrame(
-                                data=b"\x00" * 4800,
-                                sample_rate=24000,
-                                num_channels=1,
-                                samples_per_channel=2400,
-                            )
-                            if self._current_audio_stream:
-                                self._current_audio_stream.push(silent)
-                        else:
-                            frame = _wav_bytes_to_frame(base64.b64decode(content))
-                            if frame and self._current_audio_stream:
-                                self._current_audio_stream.push(frame)
+                        frame = _wav_bytes_to_frame(base64.b64decode(content))
+                        if frame and self._current_audio_stream:
+                            self._current_audio_stream.push(frame)
                     elif content:
                         assistant_text += content
                         if self._current_text_stream:
@@ -403,17 +392,6 @@ class VLLMRealtimeSession(RealtimeSession):
             logger.info("Generation cancelled")
         except Exception:
             logger.exception("Chat completion error")
-
-        if has_tool_calls and self._current_audio_stream:
-            # Push extended silence to keep playback alive during tool execution
-            silence_duration_s = 30
-            silence = rtc.AudioFrame(
-                data=b"\x00" * (24000 * 2 * silence_duration_s),
-                sample_rate=24000,
-                num_channels=1,
-                samples_per_channel=24000 * silence_duration_s,
-            )
-            self._current_audio_stream.push(silence)
 
         if assistant_text and not has_tool_calls:
             logger.info("Assistant: %s", assistant_text[:100])
