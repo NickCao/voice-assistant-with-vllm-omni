@@ -331,7 +331,24 @@ class VLLMRealtimeSession(RealtimeSession):
             stream = await self._client.chat.completions.create(**kwargs)
 
             async for chunk in stream:
-                state.handle_chunk(chunk)
+                for event in state.handle_chunk(chunk):
+                    if event.type == "tool_calls.function.arguments.done":
+                        has_tool_calls = True
+                        tc = event.tool_call
+                        logger.info("Tool call: %s(%s)", event.name, event.arguments[:100])
+                        if self._model._room:
+                            await self._model._room.local_participant.publish_data(
+                                json_mod.dumps({"name": event.name, "arguments": event.arguments}).encode(),
+                                topic="tool_call",
+                            )
+                        self._current_function_stream.send_nowait(
+                            FunctionCall(
+                                call_id=tc.id if tc else "",
+                                name=event.name,
+                                arguments=event.arguments,
+                            )
+                        )
+
                 modality = getattr(chunk, "modality", None)
                 for choice in chunk.choices:
                     delta = getattr(choice, "delta", None)
@@ -358,35 +375,6 @@ class VLLMRealtimeSession(RealtimeSession):
                         assistant_text += content
                         if self._current_text_stream:
                             self._current_text_stream.push(content)
-
-            # Emit tool calls accumulated by the SDK
-            has_tool_calls = False
-            completion = state.get_final_completion()
-            if completion.choices:
-                msg = completion.choices[0].message
-                if msg.tool_calls:
-                    has_tool_calls = True
-                    ttfa = time.perf_counter() - generation_start
-                    logger.info("Time to first tool call: %.3fs", ttfa)
-                    if self._model._room:
-                        await self._model._room.local_participant.publish_data(
-                            f'{{"ttfa": {ttfa:.3f}, "tool_call": true}}'.encode(),
-                            topic="latency",
-                        )
-
-                    for tc in msg.tool_calls:
-                        logger.info("Tool call: %s(%s)", tc.function.name, tc.function.arguments[:100])
-                        if self._model._room:
-                            await self._model._room.local_participant.publish_data(
-                                json_mod.dumps({"name": tc.function.name, "arguments": tc.function.arguments}).encode(),
-                                topic="tool_call",
-                            )
-                        fnc_call = FunctionCall(
-                            call_id=tc.id,
-                            name=tc.function.name,
-                            arguments=tc.function.arguments,
-                        )
-                        self._current_function_stream.send_nowait(fnc_call)
 
         except asyncio.CancelledError:
             logger.info("Generation cancelled")
