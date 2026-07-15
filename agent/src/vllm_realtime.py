@@ -360,7 +360,7 @@ class VLLMRealtimeSession(RealtimeSession):
                         continue
                     content = getattr(delta, "content", None)
 
-                    if modality == "audio" and content and not has_tool_calls:
+                    if modality == "audio" and content:
                         if first_audio:
                             first_audio = False
                             ttfa = time.perf_counter() - generation_start
@@ -372,9 +372,20 @@ class VLLMRealtimeSession(RealtimeSession):
                                     f'{{"ttfa": {ttfa:.3f}, "interrupted": {str(interrupted).lower()}}}'.encode(),
                                     topic="latency",
                                 )
-                        frame = _wav_bytes_to_frame(base64.b64decode(content))
-                        if frame and self._current_audio_stream:
-                            self._current_audio_stream.push(frame)
+                        if has_tool_calls:
+                            # Push silence to keep playback alive during tool execution
+                            silent = rtc.AudioFrame(
+                                data=b"\x00" * 4800,
+                                sample_rate=24000,
+                                num_channels=1,
+                                samples_per_channel=2400,
+                            )
+                            if self._current_audio_stream:
+                                self._current_audio_stream.push(silent)
+                        else:
+                            frame = _wav_bytes_to_frame(base64.b64decode(content))
+                            if frame and self._current_audio_stream:
+                                self._current_audio_stream.push(frame)
                     elif content:
                         assistant_text += content
                         if self._current_text_stream:
