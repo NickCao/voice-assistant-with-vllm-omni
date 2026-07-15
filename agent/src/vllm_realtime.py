@@ -334,7 +334,7 @@ class VLLMRealtimeSession(RealtimeSession):
                 for event in state.handle_chunk(chunk):
                     if event.type == "tool_calls.function.arguments.done":
                         has_tool_calls = True
-                        tc = event.tool_call
+                        call_id = getattr(event, "call_id", "") or f"call_{event.index}"
                         logger.info("Tool call: %s(%s)", event.name, event.arguments[:100])
                         if self._model._room:
                             await self._model._room.local_participant.publish_data(
@@ -343,7 +343,7 @@ class VLLMRealtimeSession(RealtimeSession):
                             )
                         self._current_function_stream.send_nowait(
                             FunctionCall(
-                                call_id=tc.id if tc else "",
+                                call_id=call_id,
                                 name=event.name,
                                 arguments=event.arguments,
                             )
