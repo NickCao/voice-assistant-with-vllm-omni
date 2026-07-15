@@ -307,6 +307,7 @@ class VLLMRealtimeSession(RealtimeSession):
         }
 
         tools_param = self._tool_ctx.parse_function_tools("openai") or None
+        logger.info("Tools available: %d", len(tools_param) if tools_param else 0)
 
         assistant_text = ""
         generation_start = time.perf_counter()
@@ -391,21 +392,21 @@ class VLLMRealtimeSession(RealtimeSession):
             logger.info("Generation cancelled")
         except Exception:
             logger.exception("Chat completion error")
-        finally:
-            if assistant_text and not has_tool_calls:
-                logger.info("Assistant: %s", assistant_text[:100])
-                self._conversation.append(user_message)
-                self._conversation.append({
-                    "role": "assistant",
-                    "content": assistant_text,
-                })
-            self._finish_generation(keep_audio_open=has_tool_calls)
 
-    def _finish_generation(self, keep_audio_open: bool = False) -> None:
+        if assistant_text and not has_tool_calls:
+            logger.info("Assistant: %s", assistant_text[:100])
+            self._conversation.append(user_message)
+            self._conversation.append({
+                "role": "assistant",
+                "content": assistant_text,
+            })
+        self._finish_generation()
+
+    def _finish_generation(self) -> None:
         if self._current_text_stream:
             self._current_text_stream.close()
             self._current_text_stream = None
-        if self._current_audio_stream and not keep_audio_open:
+        if self._current_audio_stream:
             self._current_audio_stream.close()
             self._current_audio_stream = None
         if getattr(self, "_current_function_stream", None) is not None:
