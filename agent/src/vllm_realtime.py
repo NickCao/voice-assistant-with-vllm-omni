@@ -396,6 +396,17 @@ class VLLMRealtimeSession(RealtimeSession):
         except Exception:
             logger.exception("Chat completion error")
 
+        if has_tool_calls and self._current_audio_stream:
+            # Push extended silence to keep playback alive during tool execution
+            silence_duration_s = 30
+            silence = rtc.AudioFrame(
+                data=b"\x00" * (24000 * 2 * silence_duration_s),
+                sample_rate=24000,
+                num_channels=1,
+                samples_per_channel=24000 * silence_duration_s,
+            )
+            self._current_audio_stream.push(silence)
+
         if assistant_text and not has_tool_calls:
             logger.info("Assistant: %s", assistant_text[:100])
             self._conversation.append(user_message)
