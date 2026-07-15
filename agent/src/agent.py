@@ -2,7 +2,15 @@ import logging
 import os
 
 from dotenv import load_dotenv
-from livekit.agents import Agent, AgentServer, AgentSession, AutoSubscribe, JobContext, cli
+from livekit.agents import (
+    Agent,
+    AgentServer,
+    AgentSession,
+    AutoSubscribe,
+    JobContext,
+    cli,
+    metrics,
+)
 from livekit.plugins import silero
 
 from vllm_realtime import VLLMRealtimeModel
@@ -36,6 +44,10 @@ async def entrypoint(ctx: JobContext):
         vad=silero.VAD.load(),
         turn_detection="vad",
     )
+    @session.on("metrics_collected")
+    def _on_metrics(ev):
+        metrics.log_metrics(ev.metrics)
+
     await session.start(
         agent=VoiceAssistant(),
         room=ctx.room,
