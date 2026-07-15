@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: ghcr.io/redhat-et/voice-assistant-with-vllm-omni/frontend:latest
+          image: ghcr.io/nickcao/voice-assistant-with-vllm-omni/frontend:latest
           ports:
             - name: http
               containerPort: 3000

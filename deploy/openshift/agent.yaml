@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: agent
-          image: ghcr.io/redhat-et/voice-assistant-with-vllm-omni/agent:latest
+          image: ghcr.io/nickcao/voice-assistant-with-vllm-omni/agent:latest
           env:
             - name: LIVEKIT_URL
               value: ws://livekit-server:7880
