@@ -360,7 +360,7 @@ class VLLMRealtimeSession(RealtimeSession):
                         continue
                     content = getattr(delta, "content", None)
 
-                    if modality == "audio" and content and not tools_param:
+                    if modality == "audio" and content and not has_tool_calls:
                         if first_audio:
                             first_audio = False
                             ttfa = time.perf_counter() - generation_start
