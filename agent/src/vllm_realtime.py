@@ -29,6 +29,38 @@ from openai.lib.streaming.chat import ChatCompletionStreamState
 
 logger = logging.getLogger("vllm-realtime")
 
+MAX_TOOL_ROUNDS = 5
+
+
+class _ToolCallInfo:
+    __slots__ = ("call_id", "name", "arguments")
+
+    def __init__(self, *, call_id: str, name: str, arguments: str) -> None:
+        self.call_id = call_id
+        self.name = name
+        self.arguments = arguments
+
+
+class _CompletionResult:
+    __slots__ = ("text", "tool_calls")
+
+    def __init__(self, *, text: str, tool_calls: list[_ToolCallInfo]) -> None:
+        self.text = text
+        self.tool_calls = tool_calls
+
+    def to_assistant_message(self) -> dict:
+        msg: dict = {"role": "assistant", "content": self.text or None}
+        if self.tool_calls:
+            msg["tool_calls"] = [
+                {
+                    "id": tc.call_id,
+                    "type": "function",
+                    "function": {"name": tc.name, "arguments": tc.arguments},
+                }
+                for tc in self.tool_calls
+            ]
+        return msg
+
 
 
 class _AudioStream:
@@ -178,7 +210,6 @@ class VLLMRealtimeSession(RealtimeSession):
         self._current_text_stream: _TextStream | None = None
         self._generation_task: asyncio.Task | None = None
         self._interrupted = False
-        self._has_pending_tool_calls = False
         self._audio_source: rtc.AudioSource | None = None
         self._audio_track_published = False
 
@@ -238,8 +269,7 @@ class VLLMRealtimeSession(RealtimeSession):
         self._audio_buffer.clear()
 
     def interrupt(self) -> None:
-        import traceback
-        logger.info("Interrupt requested, stack:\n%s", "".join(traceback.format_stack()))
+        logger.info("Interrupt requested")
         self._interrupted = True
         if self._generation_task and not self._generation_task.done():
             self._generation_task.cancel()
@@ -266,18 +296,17 @@ class VLLMRealtimeSession(RealtimeSession):
 
         logger.info("Generating reply from %d audio frames", len(frames))
 
-        # PoC: conversation history grows unbounded (including base64 audio).
-        # Production code should trim older turns or replace audio with transcripts.
         messages: list[dict] = []
         if self._instructions:
             messages.append({"role": "system", "content": self._instructions})
         messages.extend(self._conversation)
-        messages.append({
+        user_message = {
             "role": "user",
             "content": [
                 {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{wav_b64}"}},
             ],
-        })
+        }
+        messages.append(user_message)
 
         self._current_text_stream = _TextStream()
         self._current_function_stream: Chan[FunctionCall] = Chan()
@@ -304,101 +333,134 @@ class VLLMRealtimeSession(RealtimeSession):
             fut.set_result(event)
         self.emit("generation_created", event)
 
-        user_message = {
-            "role": "user",
-            "content": [
-                {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{wav_b64}"}},
-            ],
-        }
-
         tools_param = None
         if tool_choice != "none":
             tools_param = self._tool_ctx.parse_function_tools("openai") or None
         logger.info("Tools available: %d (tool_choice=%s)", len(tools_param) if tools_param else 0, tool_choice)
 
-        assistant_text = ""
         generation_start = time.perf_counter()
-        first_audio = True
-        has_tool_calls = False
+
         try:
-            kwargs: dict = {
-                "model": self._model._model_name,
-                "modalities": ["text", "audio"],
-                "messages": messages,
-                "stream": True,
-                "extra_body": {"speaker": self._model._speaker},
-            }
-            if tools_param:
-                kwargs["tools"] = tools_param
-                kwargs["tool_choice"] = tool_choice
-
-            state = ChatCompletionStreamState(
-                input_tools=tools_param or [],
+            result = await self._streaming_completion(
+                messages, tools_param, tool_choice, generation_start,
             )
-            stream = await self._client.chat.completions.create(**kwargs)
 
-            async for chunk in stream:
-                for event in state.handle_chunk(chunk):
-                    if event.type == "tool_calls.function.arguments.done":
-                        if not has_tool_calls:
-                            has_tool_calls = True
-                            self._has_pending_tool_calls = True
-                        call_id = getattr(event, "call_id", "") or f"call_{event.index}"
-                        logger.info("Tool call: %s(%s)", event.name, event.arguments[:100])
-                        if self._model._room:
-                            await self._model._room.local_participant.publish_data(
-                                json_mod.dumps({"name": event.name, "arguments": event.arguments}).encode(),
-                                topic="tool_call",
-                            )
-                        self._current_function_stream.send_nowait(
-                            FunctionCall(
-                                call_id=call_id,
-                                name=event.name,
-                                arguments=event.arguments,
-                            )
-                        )
+            new_history: list[dict] = [user_message]
 
-                modality = getattr(chunk, "modality", None)
-                for choice in chunk.choices:
-                    delta = getattr(choice, "delta", None)
-                    if not delta:
-                        continue
-                    content = getattr(delta, "content", None)
+            for _round in range(MAX_TOOL_ROUNDS):
+                if not result.tool_calls:
+                    break
 
-                    if modality == "audio" and content and tool_choice == "none":
-                        if first_audio:
-                            first_audio = False
-                            ttfa = time.perf_counter() - generation_start
-                            logger.info("Time to first audio: %.3fs", ttfa)
-                            interrupted = self._interrupted
-                            self._interrupted = False
-                            if self._model._room:
-                                await self._model._room.local_participant.publish_data(
-                                    f'{{"ttfa": {ttfa:.3f}, "interrupted": {str(interrupted).lower()}}}'.encode(),
-                                    topic="latency",
-                                )
-                        frame = _wav_bytes_to_frame(base64.b64decode(content))
-                        if frame:
-                            await self._ensure_audio_source()
-                            await self._audio_source.capture_frame(frame)
-                    elif content:
-                        assistant_text += content
-                        if self._current_text_stream:
-                            self._current_text_stream.push(content)
+                logger.info("Executing %d tool calls (round %d)", len(result.tool_calls), _round + 1)
+                assistant_msg = result.to_assistant_message()
+                messages.append(assistant_msg)
+                new_history.append(assistant_msg)
+
+                tool_results = await self._execute_tools(result.tool_calls)
+                messages.extend(tool_results)
+                new_history.extend(tool_results)
+
+                result = await self._streaming_completion(
+                    messages, tools_param, "auto", generation_start,
+                )
+
+            if result.text:
+                new_history.append({"role": "assistant", "content": result.text})
+            self._conversation.extend(new_history)
 
         except asyncio.CancelledError:
             logger.info("Generation cancelled")
         except Exception:
             logger.exception("Chat completion error")
 
-        if assistant_text and not has_tool_calls:
-            logger.info("Assistant: %s", assistant_text[:100])
-            self._conversation.append(user_message)
-            self._conversation.append({
-                "role": "assistant",
-                "content": assistant_text,
-            })
         self._finish_generation()
+
+    async def _streaming_completion(
+        self,
+        messages: list[dict],
+        tools_param: list | None,
+        tool_choice: str,
+        generation_start: float,
+    ) -> _CompletionResult:
+        kwargs: dict = {
+            "model": self._model._model_name,
+            "modalities": ["text", "audio"],
+            "messages": messages,
+            "stream": True,
+            "extra_body": {"speaker": self._model._speaker},
+        }
+        if tools_param and tool_choice != "none":
+            kwargs["tools"] = tools_param
+            kwargs["tool_choice"] = tool_choice
+
+        state = ChatCompletionStreamState(input_tools=tools_param or [])
+        stream = await self._client.chat.completions.create(**kwargs)
+
+        text = ""
+        tool_calls: list[_ToolCallInfo] = []
+        first_audio = True
+
+        async for chunk in stream:
+            for ev in state.handle_chunk(chunk):
+                if ev.type == "tool_calls.function.arguments.done":
+                    snap_tc = (state.current_completion_snapshot.choices[0].message.tool_calls or [])[ev.index]
+                    call_id = getattr(snap_tc, "id", "") or f"call_{ev.index}"
+                    logger.info("Tool call: %s(%s) [%s]", ev.name, ev.arguments[:100], call_id)
+                    tool_calls.append(_ToolCallInfo(call_id=call_id, name=ev.name, arguments=ev.arguments))
+                    if self._model._room:
+                        await self._model._room.local_participant.publish_data(
+                            json_mod.dumps({"name": ev.name, "arguments": ev.arguments}).encode(),
+                            topic="tool_call",
+                        )
+
+            modality = getattr(chunk, "modality", None)
+            for choice in chunk.choices:
+                delta = getattr(choice, "delta", None)
+                if not delta:
+                    continue
+                content = getattr(delta, "content", None)
+
+                if modality == "audio" and content:
+                    if first_audio:
+                        first_audio = False
+                        ttfa = time.perf_counter() - generation_start
+                        logger.info("Time to first audio: %.3fs", ttfa)
+                        interrupted = self._interrupted
+                        self._interrupted = False
+                        if self._model._room:
+                            await self._model._room.local_participant.publish_data(
+                                f'{{"ttfa": {ttfa:.3f}, "interrupted": {str(interrupted).lower()}}}'.encode(),
+                                topic="latency",
+                            )
+                    frame = _wav_bytes_to_frame(base64.b64decode(content))
+                    if frame:
+                        await self._ensure_audio_source()
+                        await self._audio_source.capture_frame(frame)
+                elif content:
+                    text += content
+                    if self._current_text_stream:
+                        self._current_text_stream.push(content)
+
+        return _CompletionResult(text=text, tool_calls=tool_calls)
+
+    async def _execute_tools(self, tool_calls: list[_ToolCallInfo]) -> list[dict]:
+        from livekit.agents.llm.utils import execute_function_call
+        from livekit.agents.llm.llm import FunctionToolCall
+
+        results = []
+        for tc in tool_calls:
+            ftc = FunctionToolCall(call_id=tc.call_id, name=tc.name, arguments=tc.arguments)
+            result = await execute_function_call(ftc, self._tool_ctx)
+            content = result.fnc_call_out.output if result.fnc_call_out else ""
+            if result.raw_exception:
+                content = f"Error: {result.raw_exception}"
+            logger.info("Tool result for %s: %s", tc.name, str(content)[:200])
+            results.append({
+                "role": "tool",
+                "tool_call_id": tc.call_id,
+                "content": str(content) if content else "",
+            })
+        return results
 
     async def _ensure_audio_source(self) -> None:
         if self._audio_source is None:
@@ -411,7 +473,6 @@ class VLLMRealtimeSession(RealtimeSession):
             self._audio_track_published = True
 
     def _finish_generation(self) -> None:
-        self._has_pending_tool_calls = False
         if self._current_text_stream:
             self._current_text_stream.close()
             self._current_text_stream = None
