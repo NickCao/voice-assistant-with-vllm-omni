@@ -2,7 +2,7 @@ import logging
 import os
 
 from dotenv import load_dotenv
-from livekit.agents import Agent, AgentServer, AgentSession, AutoSubscribe, JobContext, cli
+from livekit.agents import Agent, AgentServer, AgentSession, AutoSubscribe, JobContext, cli, mcp
 from livekit.plugins import silero
 
 from vllm_realtime import VLLMRealtimeModel
