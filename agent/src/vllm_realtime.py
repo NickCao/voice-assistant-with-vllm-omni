@@ -126,6 +126,7 @@ class VLLMRealtimeModel(RealtimeModel):
     def __init__(
         self, *, base_url: str, model: str, api_key: str = "EMPTY",
         speaker: str = "Ethan",
+        room: rtc.Room | None = None,
     ) -> None:
         super().__init__(
             capabilities=RealtimeCapabilities(
@@ -141,6 +142,7 @@ class VLLMRealtimeModel(RealtimeModel):
         self._model_name = model
         self._api_key = api_key
         self._speaker = speaker
+        self._room = room
         self._sessions: set[VLLMRealtimeSession] = set()
 
     @property
@@ -178,6 +180,7 @@ class VLLMRealtimeSession(RealtimeSession):
         self._current_audio_stream: _AudioStream | None = None
         self._current_text_stream: _TextStream | None = None
         self._generation_task: asyncio.Task | None = None
+        self._interrupted = False
 
     @property
     def chat_ctx(self) -> ChatContext:
@@ -235,6 +238,7 @@ class VLLMRealtimeSession(RealtimeSession):
 
     def interrupt(self) -> None:
         logger.info("Interrupt requested")
+        self._interrupted = True
         if self._generation_task and not self._generation_task.done():
             self._generation_task.cancel()
         self._finish_generation()
@@ -305,6 +309,8 @@ class VLLMRealtimeSession(RealtimeSession):
         }
 
         assistant_text = ""
+        generation_start = time.perf_counter()
+        first_audio = True
         try:
             stream = await self._client.chat.completions.create(
                 model=self._model._model_name,
@@ -323,6 +329,17 @@ class VLLMRealtimeSession(RealtimeSession):
                         continue
 
                     if modality == "audio":
+                        if first_audio:
+                            first_audio = False
+                            ttfa = time.perf_counter() - generation_start
+                            logger.info("Time to first audio: %.3fs", ttfa)
+                            interrupted = self._interrupted
+                            self._interrupted = False
+                            if self._model._room:
+                                await self._model._room.local_participant.publish_data(
+                                    f'{{"ttfa": {ttfa:.3f}, "interrupted": {str(interrupted).lower()}}}'.encode(),
+                                    topic="latency",
+                                )
                         frame = _wav_bytes_to_frame(base64.b64decode(content))
                         if frame and self._current_audio_stream:
                             self._current_audio_stream.push(frame)
