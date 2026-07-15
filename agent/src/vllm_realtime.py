@@ -178,6 +178,7 @@ class VLLMRealtimeSession(RealtimeSession):
         self._current_text_stream: _TextStream | None = None
         self._generation_task: asyncio.Task | None = None
         self._interrupted = False
+        self._has_pending_tool_calls = False
 
     @property
     def chat_ctx(self) -> ChatContext:
@@ -235,6 +236,9 @@ class VLLMRealtimeSession(RealtimeSession):
         self._audio_buffer.clear()
 
     def interrupt(self) -> None:
+        if self._has_pending_tool_calls:
+            logger.info("Interrupt requested but tool calls pending — ignoring")
+            return
         logger.info("Interrupt requested")
         self._interrupted = True
         if self._generation_task and not self._generation_task.done():
@@ -339,6 +343,7 @@ class VLLMRealtimeSession(RealtimeSession):
                     if event.type == "tool_calls.function.arguments.done":
                         if not has_tool_calls:
                             has_tool_calls = True
+                            self._has_pending_tool_calls = True
                             # Close audio/text streams so forward_generation unblocks
                             if self._current_audio_stream:
                                 self._current_audio_stream.close()
@@ -403,6 +408,7 @@ class VLLMRealtimeSession(RealtimeSession):
         self._finish_generation()
 
     def _finish_generation(self) -> None:
+        self._has_pending_tool_calls = False
         if self._current_text_stream:
             self._current_text_stream.close()
             self._current_text_stream = None
