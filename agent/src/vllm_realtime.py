@@ -311,6 +311,7 @@ class VLLMRealtimeSession(RealtimeSession):
         assistant_text = ""
         generation_start = time.perf_counter()
         first_audio = True
+        has_tool_calls = False
         try:
             kwargs: dict = {
                 "model": self._model._model_name,
@@ -358,21 +359,19 @@ class VLLMRealtimeSession(RealtimeSession):
                             self._current_text_stream.push(content)
 
             # Emit tool calls accumulated by the SDK
+            has_tool_calls = False
             completion = state.get_final_completion()
             if completion.choices:
                 msg = completion.choices[0].message
                 if msg.tool_calls:
-                    # Publish TTFA as a tool_call turn (no audio produced)
-                    if not first_audio:
-                        pass  # audio was produced, TTFA already published
-                    else:
-                        ttfa = time.perf_counter() - generation_start
-                        logger.info("Time to first tool call: %.3fs", ttfa)
-                        if self._model._room:
-                            await self._model._room.local_participant.publish_data(
-                                f'{{"ttfa": {ttfa:.3f}, "tool_call": true}}'.encode(),
-                                topic="latency",
-                            )
+                    has_tool_calls = True
+                    ttfa = time.perf_counter() - generation_start
+                    logger.info("Time to first tool call: %.3fs", ttfa)
+                    if self._model._room:
+                        await self._model._room.local_participant.publish_data(
+                            f'{{"ttfa": {ttfa:.3f}, "tool_call": true}}'.encode(),
+                            topic="latency",
+                        )
 
                     for tc in msg.tool_calls:
                         logger.info("Tool call: %s(%s)", tc.function.name, tc.function.arguments[:100])
@@ -393,20 +392,20 @@ class VLLMRealtimeSession(RealtimeSession):
         except Exception:
             logger.exception("Chat completion error")
         finally:
-            if assistant_text:
+            if assistant_text and not has_tool_calls:
                 logger.info("Assistant: %s", assistant_text[:100])
                 self._conversation.append(user_message)
                 self._conversation.append({
                     "role": "assistant",
                     "content": assistant_text,
                 })
-            self._finish_generation()
+            self._finish_generation(keep_audio_open=has_tool_calls)
 
-    def _finish_generation(self) -> None:
+    def _finish_generation(self, keep_audio_open: bool = False) -> None:
         if self._current_text_stream:
             self._current_text_stream.close()
             self._current_text_stream = None
-        if self._current_audio_stream:
+        if self._current_audio_stream and not keep_audio_open:
             self._current_audio_stream.close()
             self._current_audio_stream = None
         if getattr(self, "_current_function_stream", None) is not None:

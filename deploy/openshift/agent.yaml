@@ -18,6 +18,7 @@ spec:
       containers:
         - name: agent
           image: ghcr.io/nickcao/voice-assistant-with-vllm-omni/agent:latest
+          imagePullPolicy: Always
           env:
             - name: LIVEKIT_URL
               value: ws://livekit-server:7880
