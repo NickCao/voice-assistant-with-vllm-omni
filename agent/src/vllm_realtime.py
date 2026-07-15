@@ -419,8 +419,10 @@ class VLLMRealtimeSession(RealtimeSession):
                 if not delta:
                     continue
                 content = getattr(delta, "content", None)
+                if not content:
+                    continue
 
-                if modality == "audio" and content:
+                if modality == "audio":
                     if first_audio:
                         first_audio = False
                         ttfa = time.perf_counter() - generation_start
@@ -436,7 +438,7 @@ class VLLMRealtimeSession(RealtimeSession):
                     if frame:
                         await self._ensure_audio_source()
                         await self._audio_source.capture_frame(frame)
-                elif content:
+                elif modality == "text" or modality is None:
                     text += content
                     if self._current_text_stream:
                         self._current_text_stream.push(content)
