@@ -24,7 +24,7 @@ spec:
               protocol: TCP
           env:
             - name: LIVEKIT_URL
-              value: "<LIVEKIT_ROUTE_WSS_URL>"
+              value: "wss://livekit-ncao.apps.alpha.modelarch.org"
             - name: LIVEKIT_API_KEY
               valueFrom:
                 secretKeyRef:
