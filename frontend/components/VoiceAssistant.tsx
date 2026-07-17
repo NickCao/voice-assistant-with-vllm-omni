@@ -181,7 +181,7 @@ function AgentVisualizer() {
   useDataChannel("tool_call", (msg) => {
     try {
       const data = JSON.parse(new TextDecoder().decode(msg.payload));
-      if (data.name) {
+      if (typeof data.name === "string") {
         setToolCalls((prev) => [
           ...prev.slice(-9),
           { name: data.name, arguments: data.arguments || "", timestamp: Date.now() },
