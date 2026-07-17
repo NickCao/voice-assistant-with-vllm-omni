@@ -3,6 +3,7 @@ import os
 
 from dotenv import load_dotenv
 from livekit.agents import Agent, AgentServer, AgentSession, AutoSubscribe, JobContext, cli
+from livekit.agents.llm import function_tool
 from livekit.plugins import silero
 
 from vllm_realtime import VLLMRealtimeModel
@@ -15,10 +16,17 @@ VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8091/v1")
 server = AgentServer()
 
 
+@function_tool()
+async def get_weather(location: str) -> str:
+    """Get the current weather for a location."""
+    return f"The weather in {location} is sunny and 72°F."
+
+
 class VoiceAssistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="You are a helpful voice assistant. Respond naturally and concisely.",
+            instructions="You are a helpful voice assistant. Respond naturally and concisely. You have access to tools — use them when appropriate.",
+            tools=[get_weather],
         )
 
 
