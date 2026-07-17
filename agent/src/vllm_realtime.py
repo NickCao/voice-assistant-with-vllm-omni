@@ -226,8 +226,12 @@ class VLLMRealtimeSession(RealtimeSession):
 
         if tool_messages:
             self._conversation.extend(tool_messages)
+            messages: list[dict] = []
+            if self._instructions:
+                messages.append({"role": "system", "content": self._instructions})
+            messages.extend(self._conversation)
             self._start_generation_task(self._streaming_generation(
-                self._conversation[:], tool_choice="auto",
+                messages, tool_choice="auto",
             ))
 
     async def update_tools(self, tools: list[Tool]) -> None:
@@ -372,11 +376,14 @@ class VLLMRealtimeSession(RealtimeSession):
                             logger.info("Time to first audio: %.3fs", ttfa)
                             interrupted = self._interrupted
                             self._interrupted = False
-                            if self._model._room:
-                                await self._model._room.local_participant.publish_data(
-                                    json.dumps({"ttfa": ttfa, "interrupted": interrupted}).encode(),
-                                    topic="latency",
-                                )
+                            try:
+                                if self._model._room:
+                                    await self._model._room.local_participant.publish_data(
+                                        json.dumps({"ttfa": ttfa, "interrupted": interrupted}).encode(),
+                                        topic="latency",
+                                    )
+                            except Exception:
+                                logger.warning("Failed to publish latency")
                         frame = _wav_bytes_to_frame(base64.b64decode(content))
                         if frame and self._current_audio_stream:
                             self._current_audio_stream.push(frame)
@@ -389,19 +396,8 @@ class VLLMRealtimeSession(RealtimeSession):
             tool_calls = completion.choices[0].message.tool_calls if completion.choices else None
 
             if tool_calls:
-                if self._model._room:
-                    ttfa = time.perf_counter() - generation_start
-                    await self._model._room.local_participant.publish_data(
-                        json.dumps({"ttfa": ttfa, "tool_call": True}).encode(),
-                        topic="latency",
-                    )
                 for tc in tool_calls:
                     logger.info("Tool call: %s(%s) [%s]", tc.function.name, tc.function.arguments[:100], tc.id)
-                    if self._model._room:
-                        await self._model._room.local_participant.publish_data(
-                            json.dumps({"name": tc.function.name, "arguments": tc.function.arguments}).encode(),
-                            topic="tool_call",
-                        )
                     if self._current_function_stream:
                         self._current_function_stream.send_nowait(
                             FunctionCall(
@@ -410,16 +406,28 @@ class VLLMRealtimeSession(RealtimeSession):
                                 arguments=tc.function.arguments,
                             )
                         )
-
-            return assistant_text, tool_call_detected
+                try:
+                    if self._model._room:
+                        ttfa = time.perf_counter() - generation_start
+                        await self._model._room.local_participant.publish_data(
+                            json.dumps({"ttfa": ttfa, "tool_call": True}).encode(),
+                            topic="latency",
+                        )
+                        for tc in tool_calls:
+                            await self._model._room.local_participant.publish_data(
+                                json.dumps({"name": tc.function.name, "arguments": tc.function.arguments}).encode(),
+                                topic="tool_call",
+                            )
+                except Exception:
+                    logger.warning("Failed to publish tool call telemetry")
 
         except asyncio.CancelledError:
             logger.info("Generation cancelled")
-            return assistant_text, tool_call_detected
         except Exception:
             logger.exception("Chat completion error")
-            return assistant_text, tool_call_detected
         finally:
+            if assistant_text:
+                self._conversation.append({"role": "assistant", "content": assistant_text})
             self._finish_generation()
 
     async def _run_generation(
@@ -505,11 +513,14 @@ class VLLMRealtimeSession(RealtimeSession):
                             logger.info("Time to first audio: %.3fs", ttfa)
                             interrupted = self._interrupted
                             self._interrupted = False
-                            if self._model._room:
-                                await self._model._room.local_participant.publish_data(
-                                    json.dumps({"ttfa": ttfa, "interrupted": interrupted}).encode(),
-                                    topic="latency",
-                                )
+                            try:
+                                if self._model._room:
+                                    await self._model._room.local_participant.publish_data(
+                                        json.dumps({"ttfa": ttfa, "interrupted": interrupted}).encode(),
+                                        topic="latency",
+                                    )
+                            except Exception:
+                                logger.warning("Failed to publish latency")
                         frame = _wav_bytes_to_frame(base64.b64decode(content))
                         if frame and self._current_audio_stream:
                             self._current_audio_stream.push(frame)
@@ -522,20 +533,18 @@ class VLLMRealtimeSession(RealtimeSession):
             tool_calls = completion.choices[0].message.tool_calls if completion.choices else None
 
             if tool_calls:
-                if self._model._room:
-                    ttfa = time.perf_counter() - generation_start
-                    await self._model._room.local_participant.publish_data(
-                        json.dumps({"ttfa": ttfa, "tool_call": True}).encode(),
-                        topic="latency",
-                    )
+                try:
+                    if self._model._room:
+                        ttfa = time.perf_counter() - generation_start
+                        await self._model._room.local_participant.publish_data(
+                            json.dumps({"ttfa": ttfa, "tool_call": True}).encode(),
+                            topic="latency",
+                        )
+                except Exception:
+                    logger.warning("Failed to publish tool call latency")
                 self._conversation.append(user_message)
                 for tc in tool_calls:
                     logger.info("Tool call: %s(%s) [%s]", tc.function.name, tc.function.arguments[:100], tc.id)
-                    if self._model._room:
-                        await self._model._room.local_participant.publish_data(
-                            json.dumps({"name": tc.function.name, "arguments": tc.function.arguments}).encode(),
-                            topic="tool_call",
-                        )
                     if self._current_function_stream:
                         self._current_function_stream.send_nowait(
                             FunctionCall(
@@ -544,18 +553,27 @@ class VLLMRealtimeSession(RealtimeSession):
                                 arguments=tc.function.arguments,
                             )
                         )
+                    try:
+                        if self._model._room:
+                            await self._model._room.local_participant.publish_data(
+                                json.dumps({"name": tc.function.name, "arguments": tc.function.arguments}).encode(),
+                                topic="tool_call",
+                            )
+                    except Exception:
+                        logger.warning("Failed to publish tool call event")
+            else:
+                if assistant_text:
+                    self._conversation.append(user_message)
+                    self._conversation.append({
+                        "role": "assistant",
+                        "content": assistant_text,
+                    })
 
         except asyncio.CancelledError:
             logger.info("Generation cancelled")
         except Exception:
             logger.exception("Chat completion error")
         finally:
-            if assistant_text:
-                self._conversation.append(user_message)
-                self._conversation.append({
-                    "role": "assistant",
-                    "content": assistant_text,
-                })
             self._finish_generation()
 
     def _finish_generation(self) -> None:
