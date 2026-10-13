@@ -9,6 +9,7 @@ from livekit.agents.voice.events import FunctionToolsExecutedEvent, MetricsColle
 from livekit.plugins import openai, silero
 
 from assistant import VoiceAssistant
+from image_chat import ImageChatHandler
 
 load_dotenv(".env.local")
 logger = logging.getLogger("voice-assistant-realtime")
@@ -39,6 +40,13 @@ async def entrypoint(ctx: JobContext):
             interruption={"mode": "vad"},
         ),
     )
+    realtime_ready = asyncio.Event()
+
+    ImageChatHandler(
+        room=ctx.room,
+        realtime_session=session,
+        realtime_ready=realtime_ready,
+    )
 
     def publish(payload: dict, topic: str) -> None:
         async def _publish() -> None:
@@ -68,6 +76,7 @@ async def entrypoint(ctx: JobContext):
         agent=VoiceAssistant(),
         room=ctx.room,
     )
+    realtime_ready.set()
 
     logger.info("Voice assistant started, connected to vLLM-Omni realtime API at %s", VLLM_BASE_URL)
 

@@ -12,9 +12,9 @@ export default function Home() {
         priority
       />
       <div className="text-center">
-        <h1 className="text-3xl font-bold tracking-tight">Voice Assistant</h1>
+        <h1 className="text-3xl font-bold tracking-tight">Voice &amp; Image Assistant</h1>
         <p className="mt-2 text-zinc-400">
-          Powered by Qwen3-Omni &amp; vLLM-Omni
+          Powered by Qwen3-Omni &amp; vLLM-Omni. Send an image and ask about it by voice.
         </p>
       </div>
       <VoiceAssistant />

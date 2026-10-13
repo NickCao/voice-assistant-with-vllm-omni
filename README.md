@@ -29,6 +29,8 @@ The browser captures audio via WebRTC; LiveKit routes it to whichever Python age
 
 Both return text and spoken audio directly from Qwen3-Omni (no separate STT/TTS). The frontend renders the assistant's spoken text as a live transcript — neither agent transcribes the user's own audio, so only the assistant's side of the conversation appears as text. Both agents also publish time-to-first-audio and tool-call events over LiveKit data channels (topics `latency` and `tool_call`), driving the frontend's latency chart and tool-call log regardless of which one is active — `agent-completions` publishes them from `vllm_realtime.py` directly, `agent-realtime` derives them from `AgentSession`'s generic `metrics_collected`/`function_tools_executed` events.
 
+During a Realtime API call, the frontend lets you send a JPEG, PNG, or WebP image. The image is sent as chunked reliable LiveKit data messages and added to the active `/v1/realtime` conversation; ask about it by speaking. Image input is not available in Completions API mode.
+
 ## Prerequisites
 
 - **GPU server:** 2x NVIDIA H100 (or equivalent), [vLLM-Omni](https://github.com/vllm-project/vllm-omni) installed
@@ -125,6 +127,7 @@ See `deploy/openshift/` for the full set of manifests (LiveKit, both agents, fro
 │   ├── pyproject.toml
 │   └── src/
 │       ├── assistant.py      # Shared Agent (instructions, weather tool)
+│       ├── image_chat.py     # Realtime image data-channel handling
 │       ├── agent.py          # Completions-API entrypoint (voice-assistant-completions)
 │       ├── agent_realtime.py # Realtime-API entrypoint (voice-assistant-realtime)
 │       └── vllm_realtime.py  # RealtimeModel backed by chat completions
