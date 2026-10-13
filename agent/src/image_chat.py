@@ -245,7 +245,7 @@ class ImageChatHandler:
             role="user",
             content=[ImageContent(image=image_url)],
         )
-        await self._realtime_session.update_chat_ctx(chat_ctx)
+        await self._realtime_session.current_agent.update_chat_ctx(chat_ctx)
 
     async def _send_error_message(self, upload: _ImageUpload, error: str) -> None:
         await self._send_message(
